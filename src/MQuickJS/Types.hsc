@@ -4,6 +4,7 @@ module MQuickJS.Types where
 
 import qualified Data.Map                  as Map
 import           Data.Bits                 (Bits)
+import           Data.Word                 (Word64, Word32)
 import           Foreign.C.Types
 import           Foreign.Ptr               (plusPtr)
 import           Foreign.Storable          (Storable(..))
@@ -15,10 +16,13 @@ import qualified Language.C.Types          as C
 #include "mquickjs.h"
 
 -- Micro QuickJS uses a simple uint64_t or uint32_t for JSValue (no struct)
+-- Note: We use Word64/Word32 instead of CULong/CUInt because CULong is only
+-- 32 bits on Windows even on 64-bit systems (LLP64 data model), while the C
+-- code uses uint64_t which is always 64 bits on 64-bit platforms.
 #if INTPTR_MAX >= INT64_MAX
-type JSValue = CULong  -- 64-bit
+type JSValue = Word64  -- 64-bit (matches C's uint64_t)
 #else
-type JSValue = CUInt   -- 32-bit
+type JSValue = Word32  -- 32-bit (matches C's uint32_t)
 #endif
 
 type JSValueConst = JSValue
