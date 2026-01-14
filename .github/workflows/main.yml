@@ -1,0 +1,54 @@
+name: Haskell CI
+
+on: [push, pull_request]
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        os:
+          - ubuntu-24.04
+          - ubuntu-24.04-arm
+          - macos-15
+          - macos-15-intel
+          - macos-26
+          - windows-2022
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Stack
+        uses: haskell-actions/setup@v2
+        with:
+          enable-stack: true
+          stack-no-global: true
+          ghc-version: "9.10"
+
+      - name: Cache Stack (Unix)
+        if: runner.os != 'Windows'
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.stack
+            .stack-work
+          key: ${{ matrix.os }}-stack-${{ hashFiles('stack.yaml.lock', 'mquickjs-hs.cabal') }}
+          restore-keys: ${{ matrix.os }}-stack-
+
+      - name: Cache Stack (Windows)
+        if: runner.os == 'Windows'
+        uses: actions/cache@v4
+        with:
+          path: |
+            C:\Users\runneradmin\AppData\Roaming\stack
+            C:\Users\runneradmin\AppData\Local\Programs\stack
+            .stack-work
+          key: ${{ matrix.os }}-stack-${{ hashFiles('stack.yaml.lock', 'mquickjs-hs.cabal') }}
+          restore-keys: ${{ matrix.os }}-stack-
+
+      - name: Build
+        run: stack build
+
+      - name: Run tests
+        run: stack test
