@@ -30,7 +30,7 @@ Declare a function and call it on an argument:
 
 ```hs
 call_f = mquickjs $ do
-  _ <- eval_ "f = (x) => x+1"
+  _ <- eval_ "function f(x) { return x + 1; }"
   res <- eval "f(2)"
   liftIO $ print res
 ```
@@ -41,7 +41,7 @@ to the JS runtime:
 
 ```hs
 aeson_marshall = mquickjs $ do
-  _ <- eval_ "f = (x) => x+1"
+  _ <- eval_ "function f(x) { return x + 1; }"
   res <- withJSValue (3::Int) $ \x -> call "f" [x]
   liftIO $ print res
 ```
