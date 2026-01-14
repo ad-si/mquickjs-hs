@@ -1,6 +1,6 @@
 {-# LANGUAGE ExistentialQuantification, DuplicateRecordFields, GeneralizedNewtypeDeriving, DerivingStrategies, DeriveGeneric, RecordWildCards #-}
 
-module Quickjs.Error where
+module MQuickJS.Error where
 import           Control.Exception   (Exception(..), SomeException)
 import           Data.Typeable       (cast)
 import           Data.Text           (Text)
@@ -10,7 +10,7 @@ import           GHC.Generics
 import           Foreign.C.Types
 import           Data.Aeson          (ToJSON(..))
 
-import           Quickjs.Types
+import           MQuickJS.Types
 
 
 data SomeJSRuntimeException = forall e . Exception e => SomeJSRuntimeException e deriving Typeable
@@ -33,7 +33,7 @@ jsRuntimeExceptionFromException x = do
 instance ToJSON CLong where
   toJSON cl = toJSON (fromIntegral cl :: Integer)
 
-data UnknownJSTag = UnknownJSTag {raw_tag :: !CLong} 
+data UnknownJSTag = UnknownJSTag {raw_tag :: !CLong}
   deriving (Generic, Typeable)
 
 instance Exception UnknownJSTag where
@@ -45,7 +45,7 @@ instance Show UnknownJSTag where
   show UnknownJSTag{..} = "Uknown JS tag: " ++ show raw_tag
 
 
-data UnsupportedTypeTag = UnsupportedTypeTag {_tag :: JSTagEnum} 
+data UnsupportedTypeTag = UnsupportedTypeTag {_tag :: JSTagEnum}
   deriving (Generic, Typeable)
 
 instance Exception UnsupportedTypeTag where
@@ -56,7 +56,7 @@ instance Show UnsupportedTypeTag where
   show UnsupportedTypeTag{..} = "Unsupported type tag: " ++ show _tag
 
 
-data JSException = JSException {location :: Text, message :: Text} 
+data JSException = JSException {location :: Text, message :: Text}
   deriving (Generic, Typeable)
 
 instance Exception JSException where
@@ -69,7 +69,7 @@ instance Show JSException where
 
 
 
-data JSValueUndefined = JSValueUndefined {value :: Text} 
+data JSValueUndefined = JSValueUndefined {value :: Text}
   deriving (Generic, Typeable)
 
 instance Exception JSValueUndefined where
@@ -81,12 +81,12 @@ instance Show JSValueUndefined where
   show JSValueUndefined{..} =  "The JS value '" ++ toS value ++ "' is undefined."
 
 
-data JSValueIncorrectType = 
+data JSValueIncorrectType =
   JSValueIncorrectType {
     name :: Text
   , expected :: JSTypeEnum
   , found :: JSTypeEnum
-  } 
+  }
   deriving (Generic, Typeable)
 
 instance Exception JSValueIncorrectType where
@@ -98,7 +98,7 @@ instance Show JSValueIncorrectType where
   show JSValueIncorrectType{..} = "Type mismatch of the JS value '" ++ toS name ++ "'. Expected: " ++ show expected ++ ", found: " ++ show found
 
 
-data InternalError = InternalError { message :: Text } 
+data InternalError = InternalError { message :: Text }
   deriving (Generic, Typeable)
 
 instance Exception InternalError where

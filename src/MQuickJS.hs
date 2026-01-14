@@ -1,18 +1,16 @@
 {-# LANGUAGE BangPatterns, QuasiQuotes, TemplateHaskell, OverloadedStrings, ScopedTypeVariables, FlexibleContexts #-}
 
 {-|
-Module      : Quickjs
-Description : Haskell bindings to the [QuickJS](https://bellard.org/quickjs/) library
-Copyright   : (c) Samuel Balco, 2020
+Module      : MQuickJS
+Description : Haskell bindings to the [Micro QuickJS](https://github.com/bellard/mquickjs) library
 License     : MIT
-Maintainer  : goodlyrottenapple@gmail.com
 
-This is a very basic wrapper for the [QuickJS](https://bellard.org/quickjs/) .
+This is a very basic wrapper for the [Micro QuickJS](https://github.com/bellard/mquickjs) library.
 
 The current functionality includes evaluating JS code, calling a JS function in the global scope
 and marshalling 'Value's to and from 'JSValue's.
 -}
-module Quickjs (JSValue, JSContextPtr, quickjs, quickjsMultithreaded, call, eval, eval_, withJSValue, fromJSValue_) where
+module MQuickJS (JSValue, JSContextPtr, mquickjs, mquickjsWithMemory, mquickjsMultithreaded, mquickjsMultithreadedWithMemory, call, eval, eval_, withJSValue, fromJSValue_) where
 
 import           Foreign
 import           Foreign.C                   (CString, CInt, CDouble, CSize)
@@ -36,38 +34,28 @@ import           Data.String.Conv            (toS)
 import           Data.Time.Clock.POSIX       (posixSecondsToUTCTime)
 import           Control.Concurrent          (rtsSupportsBoundThreads, runInBoundThread)
 
-import           Quickjs.Types
-import           Quickjs.Error
+import           MQuickJS.Types
+import           MQuickJS.Error
 
 
-C.context quickjsCtx
-C.include "quickjs.h"
-C.include "quickjs-libc.h"
+C.context mquickjsCtx
+C.include "<stddef.h>"
+C.include "mquickjs.h"
 
-
-foreign import ccall "JS_NewRuntime"
-  jsNewRuntime :: IO (Ptr JSRuntime)
-
-foreign import ccall "JS_FreeRuntime"
-  jsFreeRuntime :: Ptr JSRuntime -> IO ()
+-- Reference to the stdlib defined in example_stdlib.c
+C.verbatim "extern const JSSTDLibraryDef js_stdlib;"
 
 foreign import ccall "JS_NewContext"
-  jsNewContext :: Ptr JSRuntime -> IO (Ptr JSContext)
+  jsNewContext :: Ptr Word8 -> CSize -> Ptr () -> IO (Ptr JSContext)
 
 foreign import ccall "JS_FreeContext"
   jsFreeContext :: Ptr JSContext -> IO ()
 
 
 
+-- Micro QuickJS uses automatic GC, no manual reference counting needed
 jsFreeValue :: JSContextPtr -> JSValue -> IO ()
-jsFreeValue ctx val = with val $ \v -> [C.block| void {
-    if (JS_VALUE_HAS_REF_COUNT(*$(JSValue *v))) {
-      JSRefCountHeader *p = (JSRefCountHeader *)JS_VALUE_GET_PTR(*$(JSValue *v));
-      if (--p->ref_count <= 0) {
-        __JS_FreeValue($(JSContext *ctx), *$(JSValue *v));
-      }
-    }
-  } |]
+jsFreeValue _ _ = return ()  -- No-op in Micro QuickJS
 
 
 
@@ -82,20 +70,17 @@ jsIs_ val fun = do
 -- jsIsNumber :: MonadIO m => JSValue -> m Bool
 -- jsIsNumber val = jsIs_ val $ \valPtr -> [C.block| int { return JS_IsNumber(*$(JSValueConst *valPtr)); } |]
 
+-- Micro QuickJS uses JS_GetClassID instead of JS_IsArray
 jsIsArray :: MonadIO m => JSContextPtr -> JSValue -> m Bool
-jsIsArray ctxPtr val = jsIs_ val $ \valPtr -> [C.block| int { return JS_IsArray($(JSContext *ctxPtr), *$(JSValueConst *valPtr)); } |]
+jsIsArray ctxPtr val = do
+  classId <- liftIO $ [C.block| int { return JS_GetClassID($(JSContext *ctxPtr), $(JSValue val)); } |]
+  return $ classId == 1  -- JS_CLASS_ARRAY = 1
 
+-- Micro QuickJS uses JS_GetClassID for Date detection (JS_CLASS_DATE = 7)
 jsIsDate :: MonadIO m => JSContextPtr -> JSValue -> m Bool
 jsIsDate ctxPtr val = do
-  globalObject <- liftIO $ C.withPtr_ $ \globalObjectPtr ->
-      [C.block| void { *$(JSValue *globalObjectPtr) = JS_GetGlobalObject($(JSContext *ctxPtr)); } |]
-  dateConstructor <- jsGetPropertyStr ctxPtr globalObject "Date"
-  liftIO $ do
-    jsFreeValue ctxPtr globalObject
-    res <- with val $ \valPtr -> with dateConstructor $ \dateCPtr ->
-      [C.block| int { return JS_IsInstanceOf($(JSContext *ctxPtr), *$(JSValueConst *valPtr), *$(JSValueConst *dateCPtr)); } |]
-    jsFreeValue ctxPtr dateConstructor
-    return $ res > 0
+  classId <- liftIO $ [C.block| int { return JS_GetClassID($(JSContext *ctxPtr), $(JSValue val)); } |]
+  return $ classId == 7  -- JS_CLASS_DATE = 7
 
 
 jsIsTryAll :: MonadThrow m =>
@@ -107,27 +92,51 @@ jsIsTryAll jsval (f:funs)(l:lbls) def = do
 jsIsTryAll _ _ _ _ = throwM $ InternalError $ "jsIsTryAll_ unreachable case"
 
 
+-- Micro QuickJS type detection - simpler approach using helper functions
 jsIs :: (MonadIO m, MonadThrow m) => JSContextPtr -> JSValue -> m JSTypeEnum
-jsIs ctx jsval = case fromCType $ tag jsval of
-  Just JSTagObject ->
-    jsIsTryAll jsval [jsIsArray ctx, jsIsDate ctx] [JSIsArray, JSIsDate] (JSTypeFromTag JSTagObject)
-  Just t | t == JSTagBigDecimal ||
-           t == JSTagBigInt ||
-           t == JSTagBigFloat ||
-           t == JSTagInt ||
-           t == JSTagFloat64 -> return JSIsNumber
-         | otherwise -> return $ JSTypeFromTag t
-  Nothing -> throwM $ UnknownJSTag (tag jsval)
+jsIs ctx jsval = liftIO $ do
+  -- Check for exception first
+  isException <- [C.block| int { return JS_IsException($(JSValue jsval)); } |]
+  if isException /= 0 then return $ JSTypeFromTag JSTagException
+  else do
+    -- Check for null/undefined
+    isNull <- [C.block| int { return $(JSValue jsval) == JS_NULL; } |]
+    if isNull /= 0 then return $ JSTypeFromTag JSTagNull
+    else do
+      isUndef <- [C.block| int { return $(JSValue jsval) == JS_UNDEFINED; } |]
+      if isUndef /= 0 then return $ JSTypeFromTag JSTagUndefined
+      else do
+        -- Check for boolean
+        isBoolTrue <- [C.block| int { return $(JSValue jsval) == JS_TRUE; } |]
+        isBoolFalse <- [C.block| int { return $(JSValue jsval) == JS_FALSE; } |]
+        if isBoolTrue /= 0 || isBoolFalse /= 0 then return $ JSTypeFromTag JSTagBool
+        else do
+          -- Check for number (int or float)
+          isNum <- [C.block| int { return JS_IsNumber($(JSContext *ctx), $(JSValue jsval)); } |]
+          if isNum /= 0 then return JSIsNumber
+          else do
+            -- Check for string
+            isStr <- [C.block| int { return JS_IsString($(JSContext *ctx), $(JSValue jsval)); } |]
+            if isStr /= 0 then return $ JSTypeFromTag JSTagPtr  -- Using JSTagPtr for strings
+            else do
+              -- Check class ID for arrays, dates, objects
+              classId <- [C.block| int { return JS_GetClassID($(JSContext *ctx), $(JSValue jsval)); } |]
+              case classId of
+                1 -> return JSIsArray   -- JS_CLASS_ARRAY
+                7 -> return JSIsDate    -- JS_CLASS_DATE
+                _ -> return $ JSTypeFromTag JSTagPtr  -- Generic object
 
 
 
+-- Micro QuickJS null value constant
 jsNullValue :: JSValue
-jsNullValue = JSValue { u = 0, tag = toCType JSTagNull }
+jsNullValue = 7  -- JS_NULL = JS_VALUE_MAKE_SPECIAL(JS_TAG_NULL, 0) = 7
 
+-- Micro QuickJS: JS_NewBool doesn't need ctx parameter
 jsNewBool :: JSContextPtr -> Bool -> IO JSValue
-jsNewBool ctxPtr bool = do
+jsNewBool _ bool = do
   let b = if bool then 1 else 0
-  C.withPtr_ $ \ptr -> [C.block| void { *$(JSValue *ptr) = JS_NewBool($(JSContext *ctxPtr), $(int b)); } |]
+  return $ [C.pure| JSValue { JS_NewBool($(int b)) } |]
 
 jsNewFloat64 :: JSContextPtr -> CDouble -> IO JSValue
 jsNewFloat64 ctxPtr num =
@@ -145,13 +154,11 @@ jsNewString ctxPtr s = C.withPtr_ $ \ptr -> useAsCStringLen s $ \(cstringPtr, cs
 
 
 checkIsException :: (MonadThrow m, MonadIO m) => Text -> JSContextPtr -> JSValue -> m ()
-checkIsException loc ctxPtr val =
-  case fromCType $ tag val of
-    Just JSTagException -> do
-      err <- getErrorMessage ctxPtr
-      liftIO $ jsFreeValue ctxPtr val
-      throwM $ JSException loc err
-    _ -> pure ()
+checkIsException loc ctxPtr val = do
+  isEx <- liftIO $ [C.block| int { return JS_IsException($(JSValue val)); } |]
+  when (isEx /= 0) $ do
+    err <- getErrorMessage ctxPtr
+    throwM $ JSException loc err
 
 
 
@@ -165,7 +172,8 @@ jsonToJSValue ctx (Number n) =
     Nothing -> throwM $ InternalError "Value does not fit in Int64"
 jsonToJSValue ctx (String s) = liftIO $ jsNewString ctx $ toS s
 jsonToJSValue ctxPtr (Array xs) = do
-  arrVal <- liftIO (C.withPtr_ $ \arrValPtr -> [C.block| void { *$(JSValueConst *arrValPtr) = JS_NewArray($(JSContext *ctxPtr)); } |])
+  -- Micro QuickJS: JS_NewArray takes initial length parameter
+  arrVal <- liftIO $ [C.block| JSValue { return JS_NewArray($(JSContext *ctxPtr), 0); } |]
 
   checkIsException "jsonToJSValue/Array/1" ctxPtr arrVal
 
@@ -174,25 +182,15 @@ jsonToJSValue ctxPtr (Array xs) = do
     checkIsException "jsonToJSValue/Array/2" ctxPtr val
 
     let idx = fromIntegral index
-    code <- liftIO (with arrVal $ \arrValPtr -> with val $ \valPtr ->
-      [C.block| int { return JS_DefinePropertyValueUint32(
-        $(JSContext *ctxPtr),
-        *$(JSValueConst *arrValPtr),
-        $(uint32_t idx),
-        *$(JSValueConst *valPtr),
-        JS_PROP_C_W_E
-      ); } |])
-    return ()
-
-    if (code < 0) then do
-      liftIO $ jsFreeValue ctxPtr arrVal
-      throwM $ InternalError "Could not append element to array"
-    else return ()
+    -- Micro QuickJS: JS_SetPropertyUint32 returns JSValue (exception or undefined)
+    res <- liftIO $ [C.block| JSValue {
+      return JS_SetPropertyUint32($(JSContext *ctxPtr), $(JSValue arrVal), $(uint32_t idx), $(JSValue val));
+    } |]
+    checkIsException "jsonToJSValue/Array/set" ctxPtr res
 
   return arrVal
 jsonToJSValue ctxPtr (Object o) = do
-  objVal <- liftIO (C.withPtr_ $ \objValPtr ->
-    [C.block| void { *$(JSValueConst *objValPtr) = JS_NewObject($(JSContext *ctxPtr)); } |])
+  objVal <- liftIO $ [C.block| JSValue { return JS_NewObject($(JSContext *ctxPtr)); } |]
 
   checkIsException "jsonToJSValue/Object/1" ctxPtr objVal
 
@@ -200,60 +198,52 @@ jsonToJSValue ctxPtr (Object o) = do
     val <- jsonToJSValue ctxPtr value
     checkIsException "jsonToJSValue/Object/2" ctxPtr val
 
-    code <- liftIO (with objVal $ \objValPtr -> with val $ \valPtr ->
-      useAsCString (encodeUtf8 $ Key.toText key) $ \cstringPtr -> do
-        [C.block| int {
-          return JS_DefinePropertyValueStr(
-            $(JSContext *ctxPtr),
-            *$(JSValueConst *objValPtr),
-            $(const char *cstringPtr),
-            *$(JSValueConst *valPtr),
-            JS_PROP_C_W_E
-          );
-        } |])
-
-    when (code < 0) $ do
-      liftIO $ jsFreeValue ctxPtr objVal
-      throwM $ InternalError "Could not add add property to object"
+    -- Micro QuickJS: JS_SetPropertyStr returns JSValue (exception or undefined)
+    res <- liftIO $ useAsCString (encodeUtf8 $ Key.toText key) $ \cstringPtr ->
+      [C.block| JSValue {
+        return JS_SetPropertyStr($(JSContext *ctxPtr), $(JSValue objVal), $(const char *cstringPtr), $(JSValue val));
+      } |]
+    checkIsException "jsonToJSValue/Object/set" ctxPtr res
 
   return objVal
 
 
+-- Micro QuickJS: Use JS_ToNumber for boolean conversion (no JS_ToBool)
 jsToBool :: (MonadThrow m, MonadIO m) => JSContextPtr -> JSValue -> m Bool
 jsToBool ctxPtr val = do
-    code <- liftIO $ with val $ \valPtr -> [C.block| int { return JS_ToBool($(JSContext *ctxPtr), *$(JSValueConst *valPtr)); } |]
-    case code of
-        -1 -> getErrorMessage ctxPtr >>= throwM . JSException "jsToBool"
-        0 -> return False
-        _ -> return True
+    (res, code) <- liftIO $ C.withPtr $ \doublePtr ->
+      [C.block| int { return JS_ToNumber($(JSContext *ctxPtr), $(double *doublePtr), $(JSValue val)); } |]
+    if code == 0 then return (res /= 0)
+    else getErrorMessage ctxPtr >>= throwM . JSException "jsToBool"
 
+-- Micro QuickJS: Use JS_ToInt32 (no JS_ToInt64)
 jsToInt64 :: (MonadThrow m, MonadIO m) => JSContextPtr -> JSValue -> m Int64
 jsToInt64 ctxPtr val = do
-  (res, code) <- liftIO $ C.withPtr $ \intPtr -> with val $ \valPtr -> [C.block| int { return JS_ToInt64($(JSContext *ctxPtr), $(int64_t *intPtr), *$(JSValueConst *valPtr)); } |]
-  if code == 0 then return res
+  (res, code) <- liftIO $ C.withPtr $ \intPtr ->
+    [C.block| int { return JS_ToInt32($(JSContext *ctxPtr), $(int *intPtr), $(JSValue val)); } |]
+  if code == 0 then return (fromIntegral res)
   else getErrorMessage ctxPtr >>= throwM . JSException "jsToInt64"
 
-
+-- Micro QuickJS: JS_ToNumber instead of JS_ToFloat64
 jsToFloat64 :: (MonadThrow m, MonadIO m) => JSContextPtr -> JSValue -> m CDouble
 jsToFloat64 ctxPtr val = do
-  (res, code) <- liftIO $ C.withPtr $ \doublePtr -> with val $ \valPtr -> [C.block| int { return JS_ToFloat64($(JSContext *ctxPtr), $(double *doublePtr), *$(JSValueConst *valPtr)); } |]
+  (res, code) <- liftIO $ C.withPtr $ \doublePtr ->
+    [C.block| int { return JS_ToNumber($(JSContext *ctxPtr), $(double *doublePtr), $(JSValue val)); } |]
   if code == 0 then return res
   else getErrorMessage ctxPtr >>= throwM . JSException "jsToFloat64"
 
 
 
+-- Micro QuickJS: JS_ToCString requires JSCStringBuf parameter, no JS_FreeCString needed
 jsToString :: MonadIO m => JSContextPtr -> JSValue -> m ByteString
 jsToString ctxPtr val = liftIO $ do
-    cstring <- with val $ \valPtr -> [C.block| const char * { return JS_ToCString($(JSContext *ctxPtr), *$(JSValueConst *valPtr)); } |]
-    if cstring == nullPtr then return ""
-    else do
-      string <- packCString cstring
-      jsFreeCString ctxPtr cstring
-      return string
-
-
-foreign import ccall "JS_FreeCString"
-  jsFreeCString :: JSContextPtr -> CString -> IO ()
+    -- JSCStringBuf is 5 bytes
+    allocaBytes 5 $ \bufPtr -> do
+      cstring <- [C.block| const char * {
+        return JS_ToCString($(JSContext *ctxPtr), $(JSValue val), (JSCStringBuf *)$(void *bufPtr));
+      } |]
+      if cstring == nullPtr then return ""
+      else packCString cstring  -- No free needed in Micro QuickJS
 
 
 jsToJSON :: (MonadCatch m, MonadIO m) => JSContextPtr -> JSValue -> m Value
@@ -262,7 +252,6 @@ jsToJSON ctx jsval = do
   case ty of
     JSTypeFromTag JSTagException -> do
       err <- getErrorMessage ctx
-      liftIO $ jsFreeValue ctx jsval
       throwM $ JSException "jsToJSON/JSTagException" err
     JSTypeFromTag JSTagNull -> return Null
     JSTypeFromTag JSTagUndefined -> return Null
@@ -272,31 +261,36 @@ jsToJSON ctx jsval = do
     JSIsNumber -> do
       n <- jsToFloat64 ctx jsval
       return $ Number $ fromFloatDigits n
-    JSTypeFromTag JSTagString -> do
-      s <- jsToString ctx jsval
-      return $ String $ toS s
     JSIsArray -> do
       len <- do
         lenVal <- jsGetPropertyStr ctx jsval "length"
         len' <- jsToInt64 ctx lenVal
-        liftIO $ jsFreeValue ctx lenVal
         return len'
       vs <- jsArrayToJSON ctx jsval 0 (fromIntegral len)
       return $ Array $ fromList vs
     JSIsDate -> do
-      getter <- jsGetPropertyStr ctx jsval "getTime"
-
-      timestampRaw <- liftIO $ C.withPtr_ $ \res -> with getter $ \getterPtr -> with jsval $ \jsvalPtr ->
-        [C.block| void { *$(JSValue *res) = JS_Call($(JSContext *ctx), *$(JSValueConst *getterPtr), *$(JSValueConst *jsvalPtr), 0, NULL); } |]
-
+      -- Micro QuickJS: Use stack-based calling for Date.getTime()
+      timestampRaw <- liftIO $ [C.block| JSValue {
+        JSValue date = $(JSValue jsval);
+        JSContext *ctx = $(JSContext *ctx);
+        JSValue getter = JS_GetPropertyStr(ctx, date, "getTime");
+        // Stack-based call: push this, func, then call
+        JS_PushArg(ctx, date);      // this
+        JS_PushArg(ctx, getter);    // func
+        return JS_Call(ctx, 0);     // 0 args
+      } |]
+      checkIsException "jsToJSON/Date" ctx timestampRaw
       timestamp <- jsToFloat64 ctx timestampRaw
-      liftIO $ do
-        jsFreeValue ctx getter
-        jsFreeValue ctx timestampRaw
       return $ toJSON $ posixSecondsToUTCTime $ realToFrac $ timestamp / 1000
-    JSTypeFromTag JSTagObject -> do
-      o <- jsObjectToJSON ctx jsval
-      return $ Object o
+    JSTypeFromTag JSTagPtr -> do
+      -- JSTagPtr can be string or object - check which one
+      isStr <- liftIO $ [C.block| int { return JS_IsString($(JSContext *ctx), $(JSValue jsval)); } |]
+      if isStr /= 0 then do
+        s <- jsToString ctx jsval
+        return $ String $ toS s
+      else do
+        o <- jsObjectToJSON ctx jsval
+        return $ Object o
     JSTypeFromTag f -> throwM $ UnsupportedTypeTag f
     JSIsError -> throwM $ InternalError "JSIsError unreachable"
 
@@ -306,13 +300,12 @@ jsArrayToJSON ctxPtr jsval index len =
   if index < len then do
     v <- do
       let idx = fromIntegral index
-      val <- liftIO $ C.withPtr_ $ \ptr -> with jsval $ \jsvalPtr ->
-        [C.block| void { *$(JSValue *ptr) = JS_GetPropertyUint32($(JSContext *ctxPtr), *$(JSValueConst *jsvalPtr), $(uint32_t idx)); } |]
+      val <- liftIO $ [C.block| JSValue {
+        return JS_GetPropertyUint32($(JSContext *ctxPtr), $(JSValue jsval), $(uint32_t idx));
+      } |]
 
       checkIsException "jsArrayToJSON" ctxPtr val
-      res <- jsToJSON ctxPtr val
-      liftIO $ jsFreeValue ctxPtr val
-      return res
+      jsToJSON ctxPtr val
 
     vs <- jsArrayToJSON ctxPtr jsval (index+1) len
     return $ v:vs
@@ -332,97 +325,102 @@ forLoop end f = go 0
 
 
 
+-- Micro QuickJS: Use JavaScript Object.keys() for property enumeration
+-- since JS_GetOwnPropertyNames is not available in the public API
 jsObjectToJSON :: (MonadCatch m, MonadIO m) => JSContextPtr -> JSValue -> m (KeyMap Value)
 jsObjectToJSON ctxPtr obj = do
-    let flags = unJSGPNMask $ jsGPNStringMask .|. jsGPNSymbolMask .|. jsGPNEnumOnly
-    properties <- liftIO $ malloc
-    plen <- jsGetOwnPropertyNames ctxPtr obj properties flags
-      `catch` (\(e::SomeJSRuntimeException) -> do
-        liftIO $ free properties
-        throwM e
-      )
-    objPtr <- liftIO $ malloc
-    liftIO $ poke objPtr obj
+    -- Get Object.keys(obj) via JavaScript evaluation
+    keysArray <- liftIO $ [C.block| JSValue {
+      JSContext *ctx = $(JSContext *ctxPtr);
+      JSValue obj = $(JSValue obj);
 
-    res <- collectVals properties objPtr 0 plen `catch` (\(e::SomeJSRuntimeException) -> do
-        liftIO $ free objPtr
-        throwM e
-      )
-    cleanup properties plen
-    return res
+      // Get Object constructor from global
+      JSValue global = JS_GetGlobalObject(ctx);
+      JSValue objectCtor = JS_GetPropertyStr(ctx, global, "Object");
+      JSValue keysFunc = JS_GetPropertyStr(ctx, objectCtor, "keys");
+
+      // Stack-based call: Object.keys(obj)
+      JS_PushArg(ctx, obj);        // arg
+      JS_PushArg(ctx, keysFunc);   // func
+      JS_PushArg(ctx, objectCtor); // this
+      return JS_Call(ctx, 1);      // 1 argument
+    } |]
+
+    checkIsException "jsObjectToJSON/keys" ctxPtr keysArray
+
+    -- Get array length
+    lenVal <- jsGetPropertyStr ctxPtr keysArray "length"
+    len <- jsToInt64 ctxPtr lenVal
+
+    -- Iterate through keys
+    collectProps ctxPtr obj keysArray 0 (fromIntegral len)
   where
-    collectVals :: (MonadCatch m, MonadIO m) => Ptr (Ptr JSPropertyEnum) -> JSValueConstPtr -> Int -> Int -> m (KeyMap Value)
-    collectVals properties objPtr !index end
+    collectProps :: (MonadCatch m, MonadIO m) => JSContextPtr -> JSValue -> JSValue -> Int -> Int -> m (KeyMap Value)
+    collectProps ctx objVal keysArr !index end
       | index < end = do
-        let i = fromIntegral index
+          let idx = fromIntegral index
 
-        key <- do
-          key' <- liftIO $ C.withPtr_ $ \ptr -> [C.block| void { *$(JSValue *ptr) = JS_AtomToString($(JSContext *ctxPtr), (*$(JSPropertyEnum **properties))[$(uint32_t i)].atom); } |]
-          checkIsException "jsObjectToJSON/collectVals/1" ctxPtr key'
-          res <- jsToJSON ctxPtr key'
-          liftIO $ jsFreeValue ctxPtr key'
-          return res
+          -- Get key at index
+          keyVal <- liftIO $ [C.block| JSValue {
+            return JS_GetPropertyUint32($(JSContext *ctx), $(JSValue keysArr), $(uint32_t idx));
+          } |]
+          checkIsException "jsObjectToJSON/getKey" ctx keyVal
+          keyStr <- jsToString ctx keyVal
 
-        case key of
-          String k -> do
-            val <-  do
-              val' <- liftIO $ C.withPtr_ $ \ptr ->
-                [C.block| void { *$(JSValue *ptr) = JS_GetProperty($(JSContext *ctxPtr), *$(JSValueConst *objPtr), (*$(JSPropertyEnum **properties))[$(uint32_t i)].atom); } |]
-              checkIsException "jsObjectToJSON/collectVals/2" ctxPtr val'
-              res <- jsToJSON ctxPtr val'
-              liftIO $ jsFreeValue ctxPtr val'
-              return res
+          -- Get property value
+          propVal <- liftIO $ useAsCString keyStr $ \ckey ->
+            [C.block| JSValue {
+              return JS_GetPropertyStr($(JSContext *ctx), $(JSValue objVal), $(const char *ckey));
+            } |]
+          checkIsException "jsObjectToJSON/getProp" ctx propVal
+          val <- jsToJSON ctx propVal
 
-            xs <- collectVals properties objPtr (index+1) end
-            return $ insert (Key.fromText k) val xs
-          x -> throwM $ InternalError $ "Could not get property name" <> toS (encode x)
+          rest <- collectProps ctx objVal keysArr (index + 1) end
+          return $ insert (Key.fromText $ toS keyStr) val rest
 
       | otherwise = return empty
-
-    cleanup :: MonadIO m => Ptr (Ptr JSPropertyEnum) -> Int -> m ()
-    cleanup properties plen = liftIO $ do
-      forLoop plen $ \index -> do
-        let i = fromIntegral index
-        [C.block| void { JS_FreeAtom($(JSContext *ctxPtr), (*$(JSPropertyEnum **properties))[$(uint32_t i)].atom); }|]
-
-      let void_ptr = castPtr properties
-      [C.block| void { js_free($(JSContext *ctxPtr), *$(void **void_ptr)); }|]
-
-      free properties
 
 
 
 getErrorMessage :: MonadIO m => JSContextPtr -> m Text
 getErrorMessage ctxPtr = liftIO $ do
-  ex <- C.withPtr_ $ \ptr -> [C.block| void { *$(JSValue *ptr) = JS_GetException($(JSContext *ctxPtr)); } |]
+  ex <- [C.block| JSValue { return JS_GetException($(JSContext *ctxPtr)); } |]
   res <- jsToString ctxPtr ex
-  jsFreeValue ctxPtr ex
   return $ toS res
 
 
 
 jsGetPropertyStr :: MonadIO m => JSContextPtr -> JSValue -> ByteString -> m JSValue
 jsGetPropertyStr ctxPtr val str = liftIO $
-  C.withPtr_ $ \ptr -> useAsCString str $ \prop -> with val $ \valPtr ->
-    [C.block| void { *$(JSValue *ptr) = JS_GetPropertyStr($(JSContext *ctxPtr), *$(JSValueConst *valPtr), $(const char *prop)); } |]
+  useAsCString str $ \prop ->
+    [C.block| JSValue { return JS_GetPropertyStr($(JSContext *ctxPtr), $(JSValue val), $(const char *prop)); } |]
 
 
-jsGetOwnPropertyNames :: (MonadThrow m, MonadIO m) => JSContextPtr -> JSValue -> Ptr (Ptr JSPropertyEnum) -> CInt -> m Int
-jsGetOwnPropertyNames ctxPtr val properties flags = do
-  (len,code) <- liftIO $ C.withPtr $ \plen -> with val $ \valPtr ->
-    [C.block| int { return JS_GetOwnPropertyNames($(JSContext *ctxPtr), $(JSPropertyEnum **properties), $(uint32_t *plen), *$(JSValueConst *valPtr), $(int flags)); } |]
-  if code == 0 then return (fromIntegral len)
-  else throwM $ InternalError "Could not get object properties"
-
-
+-- Micro QuickJS: Stack-based function calling
+-- Push args, then func, then this, then call with argc
 jsCall :: JSContextPtr -> JSValue -> CInt -> (Ptr JSValue) -> IO JSValue
-jsCall ctxt fun_obj argc argv = C.withPtr_ $ \res -> with fun_obj $ \funPtr ->
-  [C.block| void { *$(JSValue *res) = JS_Call($(JSContext *ctxt), *$(JSValueConst *funPtr), JS_NULL, $(int argc), $(JSValueConst *argv)); } |]
+jsCall ctxt fun_obj argc argv = do
+  -- Push arguments in order, then func, then this (JS_NULL)
+  forM_ [0..(fromIntegral argc - 1)] $ \i -> do
+    arg <- peekElemOff argv i
+    let argVal = arg
+    [C.block| void {
+      JSContext *ctx = $(JSContext *ctxt);
+      JSValue v = $(JSValue argVal);
+      JS_PushArg(ctx, v);
+    } |]
+  let funVal = fun_obj
+  [C.block| void {
+    JSContext *ctx = $(JSContext *ctxt);
+    JS_PushArg(ctx, $(JSValue funVal));
+    JS_PushArg(ctx, JS_NULL);
+  } |]
+  [C.block| JSValue { return JS_Call($(JSContext *ctxt), $(int argc)); } |]
 
 
 jsEval :: JSContextPtr -> CString -> CSize -> CString -> CInt -> IO JSValue
-jsEval ctxPtr input input_len filename eval_flags = C.withPtr_ $ \ptr ->
-  [C.block| void { *$(JSValue *ptr) = JS_Eval($(JSContext *ctxPtr), $(const char *input), $(size_t input_len), $(const char *filename), $(int eval_flags)); } |]
+jsEval ctxPtr input input_len filename eval_flags =
+  [C.block| JSValue { return JS_Eval($(JSContext *ctxPtr), $(const char *input), $(size_t input_len), $(const char *filename), $(int eval_flags)); } |]
 
 
 evalRaw :: JSContextPtr -> JSEvalType -> ByteString -> IO JSValue
@@ -447,7 +445,7 @@ evalAs eTyp code = do
 Evaluates the given string and returns a 'Value' (if the result can be converted).
 -}
 eval :: (MonadMask m, MonadReader JSContextPtr m, MonadIO m) => ByteString -> m Value
-eval = evalAs Global
+eval = evalAs WithRetval  -- Micro QuickJS needs JS_EVAL_RETVAL flag to return the value
 
 evalAs_ :: (MonadThrow m, MonadReader JSContextPtr m, MonadIO m) => JSEvalType -> ByteString -> m ()
 evalAs_ eTyp code = do
@@ -500,25 +498,21 @@ withJSValue v f = do
 
 callRaw :: (MonadThrow m, MonadIO m) => JSContextPtr -> ByteString -> [JSValue] -> m JSValue
 callRaw ctxPtr funName args = do
-    globalObject <- liftIO $ C.withPtr_ $ \globalObjectPtr ->
-      [C.block| void { *$(JSValue *globalObjectPtr) = JS_GetGlobalObject($(JSContext *ctxPtr)); } |]
+    globalObject <- liftIO $ [C.block| JSValue { return JS_GetGlobalObject($(JSContext *ctxPtr)); } |]
 
     fun <- jsGetPropertyStr ctxPtr globalObject funName
-
-    liftIO $ jsFreeValue ctxPtr globalObject
 
     ty <- jsIs ctxPtr fun
     case ty of
       JSTypeFromTag JSTagException -> do
         err <- getErrorMessage ctxPtr
-        liftIO $ jsFreeValue ctxPtr fun
         throwM $ JSException "callRaw" err
       JSTypeFromTag JSTagUndefined -> throwM $ JSValueUndefined $ toS funName
-      JSTypeFromTag JSTagObject -> do
-        res <- liftIO $ withArrayLen args $ \len argv -> jsCall ctxPtr fun (fromIntegral $ len) argv
-        liftIO $ jsFreeValue ctxPtr fun
+      JSTypeFromTag JSTagPtr -> do
+        -- Micro QuickJS: Stack-based calling
+        res <- liftIO $ withArrayLen args $ \len argv -> jsCall ctxPtr fun (fromIntegral len) argv
         return res
-      _ -> throwM $ JSValueIncorrectType {name = toS funName, expected = JSTypeFromTag JSTagObject, found = ty }
+      _ -> throwM $ JSValueIncorrectType {name = toS funName, expected = JSTypeFromTag JSTagPtr, found = ty }
 
 
 -- call :: (MonadThrow m, MonadReader JSContextPtr m, MonadIO m) => String -> [JSValue] -> m JSValue
@@ -547,70 +541,74 @@ This function initialises a new JS runtime and performs the given computation wi
 
 For example, we can evaluate an expression:
 
->quickjs $ do
+>mquickjs $ do
 >  res <- eval "1+2"
 >  liftIO $ print res
 
 Declare a function and call it on an argument:
 
->quickjs $ do
+>mquickjs $ do
 >  _ <- eval_ "f = (x) => x+1"
 >  res <- eval "f(2)"
 >  liftIO $ print res
 
 Pass a Haskell value to the JS runtime:
 
->quickjs $ do
+>mquickjs $ do
 >  _ <- eval_ "f = (x) => x+1"
 >  res <- withJSValue (3::Int) $ \x -> call "f" [x]
 >  liftIO $ print res
 
 -}
-quickjs :: MonadIO m => ReaderT (Ptr JSContext) m b -> m b
-quickjs f = do
-  (rt, ctx) <- liftIO $ do
-    _rt <- jsNewRuntime
-    _ctx <- jsNewContext _rt
+mquickjs :: MonadIO m => ReaderT (Ptr JSContext) m b -> m b
+mquickjs = mquickjsWithMemory (10 * 1024 * 1024)  -- 10MB default
 
-    [C.block| void {
-      js_std_add_helpers($(JSContext *_ctx), -1, NULL);
+mquickjsWithMemory :: MonadIO m => Int -> ReaderT (Ptr JSContext) m b -> m b
+mquickjsWithMemory memSize f = do
+  (memBuf, ctx) <- liftIO $ do
+    _memBuf <- mallocBytes memSize
+    _ctx <- [C.block| JSContext * {
+      return JS_NewContext($(uint8_t *_memBuf), $(size_t memSizeC), &js_stdlib);
     } |]
-    return (_rt, _ctx)
+    return (_memBuf, _ctx)
 
   res <- runReaderT f ctx
-  cleanup ctx rt
+  cleanup memBuf ctx
   return res
   where
-    cleanup ctx rt = liftIO $ do
+    memSizeC = fromIntegral memSize
+    cleanup memBuf ctx = liftIO $ do
       jsFreeContext ctx
-      jsFreeRuntime rt
+      free memBuf
 
 {-|
-This env differs from regular 'quickjs', in that it wraps the computation in the 'runInBoundThread' function.
+This env differs from regular 'mquickjs', in that it wraps the computation in the 'runInBoundThread' function.
 This is needed when running the Haskell program mutithreaded (e.g. when using the testing framework Tasty),
-since  quickjs does not like being called from an OS thread other than the one it was started in.
+since mquickjs does not like being called from an OS thread other than the one it was started in.
 Because Haskell uses lightweight threads, this might happen if threaded mode is enabled, as is the case in Tasty.
 This problem does not occur when running via Main.hs, if compiled as single threaded...
 For more info see the paper [Extending the Haskell Foreign Function Interface with Concurrency](https://simonmar.github.io/bib/papers/conc-ffi.pdf)
 -}
-quickjsMultithreaded :: MonadUnliftIO m => ReaderT (Ptr JSContext) m b -> m b
-quickjsMultithreaded f
+mquickjsMultithreaded :: MonadUnliftIO m => ReaderT (Ptr JSContext) m b -> m b
+mquickjsMultithreaded = mquickjsMultithreadedWithMemory (10 * 1024 * 1024)  -- 10MB default
+
+mquickjsMultithreadedWithMemory :: MonadUnliftIO m => Int -> ReaderT (Ptr JSContext) m b -> m b
+mquickjsMultithreadedWithMemory memSize f
   | rtsSupportsBoundThreads = do
     (u :: UnliftIO m) <- askUnliftIO
 
     liftIO $ runInBoundThread $ do
-      rt <- jsNewRuntime
-      ctx <- jsNewContext rt
-
-      [C.block| void {
-        js_std_add_helpers($(JSContext *ctx), -1, NULL);
+      memBuf <- mallocBytes memSize
+      ctx <- [C.block| JSContext * {
+        return JS_NewContext($(uint8_t *memBuf), $(size_t memSizeC), &js_stdlib);
       } |]
 
-      res <-  unliftIO u $ runReaderT f ctx
-      cleanup ctx rt
+      res <- unliftIO u $ runReaderT f ctx
+      cleanup memBuf ctx
       return res
-  | otherwise = quickjs f
+  | otherwise = mquickjsWithMemory memSize f
   where
-    cleanup ctx rt = do
+    memSizeC = fromIntegral memSize
+    cleanup memBuf ctx = do
       jsFreeContext ctx
-      jsFreeRuntime rt
+      free memBuf

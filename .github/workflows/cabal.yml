@@ -7,9 +7,9 @@ on:
     paths:
       - 'src/**'
       - 'test/**'
-      - 'quickjs/**'
+      - 'mquickjs/**'
       - 'stack.yaml'
-      - 'quickjs-hs.cabal'
+      - 'mquickjs-hs.cabal'
   pull_request:
     branches:
     - master

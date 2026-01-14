@@ -18,20 +18,20 @@ import qualified Data.HashMap.Strict            as HM
 import qualified Data.Aeson.KeyMap             as KM
 import qualified Data.Aeson.Key             as K
 import qualified Data.Vector             as V
-import           Quickjs
+import           MQuickJS
 import Test.HUnit (assertFailure)
-import Quickjs.Error (SomeJSRuntimeException)
+import MQuickJS.Error (SomeJSRuntimeException)
 import Control.Monad(guard)
 import qualified Data.Text as T
 
 eval_1_plus_2 :: Assertion
-eval_1_plus_2 = quickjsMultithreaded $ do
+eval_1_plus_2 = mquickjsMultithreaded $ do
   v <- eval "1 + 2;"
   liftIO $ v @?= Number 3
 
 
 eval_throw :: Assertion
-eval_throw = quickjsMultithreaded $
+eval_throw = mquickjsMultithreaded $
   try (eval "throw 'Error'") >>= \case
     Left (_ :: SomeJSRuntimeException) -> return ()
     Right _ -> liftIO $ assertFailure "should fail with an Exception..."
@@ -69,7 +69,7 @@ instance QC.Arbitrary GenVal where
 
 marshall_to_from_JSValue :: GenVal -> QC.Property
 marshall_to_from_JSValue (GenVal val) = QC.monadicIO $ do
-  val' <- QC.run $ quickjsMultithreaded $ withJSValue val $ \jsval ->
+  val' <- QC.run $ mquickjsMultithreaded $ withJSValue val $ \jsval ->
     fromJSValue_ jsval
   pure $ (val QC.=== val')
 
@@ -77,8 +77,8 @@ tests :: TestTree
 tests =
   -- adjustOption (\_ -> QuickCheckTests 10) $
   -- adjustOption (\_ -> QuickCheckVerbose True) $
-  testGroup "Quickjs"
-    [ testCase "empty quickjs call" (quickjsMultithreaded $ pure ())
+  testGroup "MQuickJS"
+    [ testCase "empty mquickjs call" (mquickjsMultithreaded $ pure ())
     , testCase "eval '1 + 2;'" eval_1_plus_2
     , testCase "eval throw" eval_throw
     , testProperty "marshalling Value to JSValue and back" marshall_to_from_JSValue

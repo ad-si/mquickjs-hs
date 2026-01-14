@@ -1,9 +1,9 @@
 
 cabal-version:  1.12
-name:           quickjs-hs
+name:           mquickjs-hs
 version:        0.1.2.4
-homepage:       https://github.com/goodlyrottenapple/quickjs-hs#readme
-bug-reports:    https://github.com/goodlyrottenapple/quickjs-hs/issues
+homepage:       https://github.com/goodlyrottenapple/mquickjs-hs#readme
+bug-reports:    https://github.com/goodlyrottenapple/mquickjs-hs/issues
 author:         Sam Balco
 maintainer:     goodlyrottenapple@gmail.com
 copyright:      2020 Sam Balco
@@ -13,38 +13,40 @@ build-type:     Simple
 extra-source-files:
     README.md
     ChangeLog.md
-category:       Javascript
-synopsis:       Wrapper for the QuickJS Javascript Engine
+category:       JavaScript
+synopsis:       Wrapper for the Micro QuickJS JavaScript Engine
 description:
-    This library is a wrapper for the [QuickJS](https://bellard.org/quickjs/) Javascript Engine.
+    This library is a wrapper for
+    [Micro QuickJS](https://github.com/bellard/mquickjs),
+    a compact JavaScript Engine.
     .
-    To get started, see the ReadMe below.
+    To get started, see the Readme below.
 
 extra-source-files:
-    quickjs/*.h
+    mquickjs/*.h
 
 source-repository head
   type: git
-  location: https://github.com/goodlyrottenapple/quickjs-hs
+  location: https://github.com/goodlyrottenapple/mquickjs-hs
 
 library
   exposed-modules:
-      Quickjs, Quickjs.Types, Quickjs.Error
+      MQuickJS, MQuickJS.Types, MQuickJS.Error
   other-modules:
-      Paths_quickjs_hs
+      Paths_mquickjs_hs
   hs-source-dirs:
       src
   build-depends:
-    aeson                >=2.0   && <2.2,
+    aeson                >=2.0   && <2.3,
     base                 >=4.11  && <5,
-    bytestring           >=0.10  && <0.12,
-    containers           >=0.5   && <0.7,
+    bytestring           >=0.10  && <0.13,
+    containers           >=0.5   && <0.8,
     exceptions           >=0.8   && <0.11,
     inline-c             >=0.5   && <0.10,
     mtl                  >=2.2.2 && <2.4,
     scientific           >=0.3.5 && <0.4,
     string-conv          >=0.1.2 && <0.3,
-    text                 >=1.2.0 && <2.1,
+    text                 >=1.2.0 && <2.2,
     time                 >=1.8   && <1.14,
     transformers         >=0.5   && <0.7,
     unliftio-core        >=0.1   && <0.3,
@@ -52,32 +54,30 @@ library
     vector               >=0.12  && <0.14
 
   default-language: Haskell2010
-  include-dirs: quickjs
+  include-dirs: mquickjs
   c-sources:
-      quickjs/cutils.c
-    , quickjs/libbf.c
-    , quickjs/libunicode.c
-    , quickjs/libregexp.c
-    , quickjs/quickjs.c
-    , quickjs/quickjs-libc.c
+      mquickjs/cutils.c
+    , mquickjs/dtoa.c
+    , mquickjs/libm.c
+    , mquickjs/mquickjs.c
+    , mquickjs/stdlib_wrapper.c
   includes:
-       quickjs/quickjs.h
-     , quickjs/quickjs-libc.h
+       mquickjs/mquickjs.h
+  install-includes:
+       mquickjs/mquickjs.h
   cc-options:
-    -static -D_GNU_SOURCE
-    -DCONFIG_VERSION="2020-11-08"
-    -DCONFIG_BIGNUM
+    -static -D_GNU_SOURCE -include stddef.h
 
-test-suite quickjs-hs-test
+test-suite mquickjs-hs-test
   type:             exitcode-stdio-1.0
   main-is:          Spec.hs
   hs-source-dirs:   test
-  other-modules:    Paths_quickjs_hs
+  other-modules:    Paths_mquickjs_hs
   default-language: Haskell2010
   ghc-options:      -threaded -rtsopts -with-rtsopts=-N
   build-depends:
       base
-    , quickjs-hs           -any
+    , mquickjs-hs          -any
     , aeson
     , exceptions
     , HUnit                >=1.6.0.0
