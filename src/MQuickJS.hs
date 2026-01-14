@@ -397,11 +397,12 @@ jsGetPropertyStr ctxPtr val str = liftIO $
 
 
 -- Micro QuickJS: Stack-based function calling
--- Push args, then func, then this, then call with argc
+-- Push args in reverse order, then func, then this, then call with argc
+-- See mquickjs.c: arg[n-1] first, then ..., then arg[0], then func, then this_obj
 jsCall :: JSContextPtr -> JSValue -> CInt -> (Ptr JSValue) -> IO JSValue
 jsCall ctxt fun_obj argc argv = do
-  -- Push arguments in order, then func, then this (JS_NULL)
-  forM_ [0..(fromIntegral argc - 1)] $ \i -> do
+  -- Push arguments in reverse order (last arg first), then func, then this (JS_NULL)
+  forM_ (reverse [0..(fromIntegral argc - 1)]) $ \i -> do
     arg <- peekElemOff argv i
     let argVal = arg
     [C.block| void {

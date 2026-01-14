@@ -1,8 +1,6 @@
 # mquickjs-hs
 
-![Tests Cabal](https://github.com/goodlyrottenapple/mquickjs-hs/workflows/Tests%20Cabal/badge.svg)
-
-This package provides a Haskell wrapper for the [Micro QuickJS](https://github.com/bellard/mquickjs) Javascript Engine.
+This package provides a Haskell wrapper for the [Micro QuickJS](https://github.com/bellard/mquickjs) JavaScript Engine.
 It has been inspired by the [quickjs-rs](https://github.com/theduke/quickjs-rs)
 and [ocaml-quickjs](https://github.com/dhcmrlchtdj/ocaml-quickjs) libraries.
 
